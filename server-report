@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+
+# Minimal Bash Server Report
+# Spec Version: 1.0
+# Target OS: Debian GNU/Linux 13 (trixie)
+# Author: GitHub Copilot
+# Last Updated: 2026-03-01
+
+# Constants and Defaults
+VERSION="1.0"
+VERBOSE=0
+export PATH="$PATH:/usr/sbin:/sbin:/usr/local/sbin"
+USE_COLOR=1
+
+# Thresholds
+RAM_WARN_MB=150
+SWAP_WARN_MB=50
+LOAD_WARN=2.0
+DISK_ROOT_WARN=80
+DISK_ROOT_CRIT=90
+DISK_BOOT_WARN=70
+
+OVERALL_STATUS="OK"
+NEXT_ACTIONS=()
+
+# Parse arguments
+for arg in "$@"; do
+    case "$arg" in
+        --verbose) VERBOSE=1 ;;
+        --no-color) USE_COLOR=0 ;;
+        --help) usage; exit 0 ;;
+        *) echo "Unknown argument: $arg"; usage; exit 1 ;;
+    esac
+done
+
+if [ -t 1 ] && [ "$USE_COLOR" -eq 1 ]; then
+    COLOR_OK="\e[32m"
+    COLOR_WARN="\e[33m"
+    COLOR_CRIT="\e[31m"
+    COLOR_RESET="\e[0m"
+    COLOR_BOLD="\e[1m"
+else
+    COLOR_OK=""
+    COLOR_WARN=""
+    COLOR_CRIT=""
+    COLOR_RESET=""
+    COLOR_BOLD=""
+fi
+
+usage() {
+    echo "Usage: server-report [OPTIONS]"
+    echo "Options:"
+    echo "  --verbose    Show extended details"
+    echo "  --no-color   Disable ANSI colors"
+    echo "  --help       Show this help"
+}
+
+update_overall_status() {
+    local status="$1"
+    local action="$2"
+    if [[ "$status" == "CRIT" ]]; then
+        OVERALL_STATUS="CRIT"
+    elif [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]]; then
+        OVERALL_STATUS="WARN"
+    fi
+    [[ -n "$action" ]] && NEXT_ACTIONS+=("$action")
+}
+
+print_status() {
+    local status="$1"
+    local section="$2"
+    local summary="$3"
+    local color=""
+    if [[ "$status" == "OK" ]]; then
+        color="$COLOR_OK"
+    elif [[ "$status" == "WARN" ]]; then
+        color="$COLOR_WARN"
+    elif [[ "$status" == "CRIT" ]]; then
+        color="$COLOR_CRIT"
+    fi
+    printf "${COLOR_BOLD}${color}[%s]${COLOR_RESET} %-15s - %s\n" "$status" "$section" "$summary"
+}
+
+print_ok() { print_status "OK" "$1" "$2"; }
+print_warn() { print_status "WARN" "$1" "$2"; update_overall_status "WARN" "${3:-}"; }
+print_crit() { print_status "CRIT" "$1" "$2"; update_overall_status "CRIT" "${3:-}"; }
+
+print_header() {
+    local hostname
+    hostname=$(hostname 2>/dev/null || echo "Unknown")
+    local date_stamp
+    date_stamp=$(date -Iseconds 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local uptime_sys
+    uptime_sys=$(uptime -p 2>/dev/null || uptime)
+    local os_info
+    os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+    local kernel_info
+    kernel_info=$(uname -r)
+    
+    echo -e "${COLOR_BOLD}SERVER HEALTH & SECURITY REPORT${COLOR_RESET}"
+    echo "------------------------------------------------------------"
+    echo -e "Hostname : $hostname"
+    echo -e "Date     : $date_stamp"
+    echo -e "Uptime   : $uptime_sys"
+    echo -e "OS & Core: ${os_info:-Debian} (Kernel: $kernel_info)"
+    echo "------------------------------------------------------------"
+}
+
+check_ssh() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    if ! command -v sshd >/dev/null; then
+        print_warn "Security (SSH)" "sshd not found." "Install OpenSSH server or check PATH."
+        return
+    fi
+
+    if [ "$EUID" -ne 0 ]; then
+        summary="Requires sudo for config check. "
+        status="WARN"
+    else
+        local sshd_config
+        sshd_config=$(sshd -T 2>/dev/null)
+        
+        local prl pa am kia
+        prl=$(echo "$sshd_config" | grep "^permitrootlogin " | awk '{print $2}')
+        pa=$(echo "$sshd_config" | grep "^passwordauthentication " | awk '{print $2}')
+        am=$(echo "$sshd_config" | grep "^authenticationmethods " | awk '{$1=""; print $0}' | xargs)
+        kia=$(echo "$sshd_config" | grep "^kbdinteractiveauthentication " | awk '{print $2}')
+
+        if [[ "$prl" == "yes" ]]; then
+            status="CRIT"
+            summary+="Root login allowed. "
+            act+="Disable PermitRootLogin in sshd_config. "
+        fi
+        
+        if [[ "$pa" == "yes" || "$kia" == "yes" ]]; then
+            status="CRIT"
+            summary+="Password/KbdInteractive auth enabled. "
+            act+="Disable password/keyboard auth in sshd_config. "
+        fi
+        
+        if [[ "$am" != "publickey" ]]; then
+            if [[ "$status" != "CRIT" ]]; then status="WARN"; fi
+            summary+="Auth methods not strictly publickey (${am:-none}). "
+            act+="Set AuthenticationMethods to publickey. "
+        fi
+    fi
+    
+    local failed_count
+    failed_count=$(journalctl -u ssh -u sshd --since "24 hours ago" -q 2>/dev/null | grep -iE "Failed password|Invalid user|Connection closed by authenticating user|sshd.*preauth" | wc -l)
+    
+    if [[ -z "$summary" ]]; then
+        summary="Secure. "
+    fi
+    summary+="Failed attempts (24h): $failed_count."
+    
+    if [[ "$status" == "CRIT" ]]; then
+        print_crit "Security (SSH)" "$summary" "$act"
+    elif [[ "$status" == "WARN" ]]; then
+        print_warn "Security (SSH)" "$summary" "$act"
+    else
+        print_ok "Security (SSH)" "$summary"
+    fi
+    
+    if [[ "$VERBOSE" -eq 1 && "$failed_count" -gt 0 ]]; then
+        echo -e "      ${COLOR_BOLD}Top 5 failed IPs (24h):${COLOR_RESET}"
+        journalctl -u ssh -u sshd --since "24 hours ago" -q 2>/dev/null | grep -iE "Failed password|Invalid user|Connection closed by authenticating user|sshd.*preauth" | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | sort | uniq -c | sort -nr | head -n 5 | while read -r count ip; do
+            echo "        - $ip ($count attempts)"
+        done
+    fi
+}
+
+check_firewall() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    if ! command -v nft >/dev/null; then
+        print_warn "Firewall" "nftables not found." "Install and configure nftables."
+        return
+    fi
+    
+    if [ "$EUID" -ne 0 ]; then
+        print_warn "Firewall" "Requires sudo." "Run with sudo to check firewall."
+        return
+    fi
+    
+    local policy=""
+    local filter_rule
+    filter_rule=$(nft list ruleset 2>/dev/null | awk '/hook input/,/\}/' | grep -E "type filter hook input" | head -n 1)
+    if [[ -n "$filter_rule" ]]; then
+        policy=$(echo "$filter_rule" | grep -oE "policy [a-z]+" | awk '{print $2}')
+        if [[ "$policy" != "drop" ]]; then
+            status="CRIT"
+            summary="Input policy is '${policy:-unknown}' (not drop). "
+            act+="Set nftables input policy to drop. "
+        fi
+    else
+        status="CRIT"
+        summary="No input filter hook found in nftables. "
+        act+="Configure nftables rules. "
+    fi
+    
+    local open_ports
+    open_ports=$(ss -tulpn 2>/dev/null | awk 'NR>1 {print $5}' | grep -E "^(0\.0\.0\.0|\[::\]|[*]):" | awk -F':' '{print $NF}' | sort -nu | xargs)
+    local bad_ports=0
+    for p in $open_ports; do
+        if [[ "$p" != "22" ]]; then
+            bad_ports=1
+        fi
+    done
+    
+    if [[ "$bad_ports" -eq 1 ]]; then
+        status="CRIT"
+        summary+="Unexpected external ports open ($open_ports). "
+        act+="Close unexpected external ports ($open_ports). "
+    else
+        summary+="Open external ports: ${open_ports:-None}. "
+    fi
+
+    if [[ "$status" == "CRIT" ]]; then
+        print_crit "Firewall" "$summary" "$act"
+    elif [[ "$status" == "WARN" ]]; then
+        print_warn "Firewall" "$summary" "$act"
+    else
+        print_ok "Firewall" "Drop policy active. Open: ${open_ports:-None}."
+    fi
+    
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        echo -e "      ${COLOR_BOLD}Firewall Ruleset Summary (Input):${COLOR_RESET}"
+        nft list ruleset 2>/dev/null | awk '/hook input/,/\}/' | grep -v "\}" | sed 's/^/        /' || echo "        None"
+        
+        local fail2ban_ips
+        fail2ban_ips=$(nft list ruleset 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | wc -l)
+        if [[ "$fail2ban_ips" -gt 0 ]]; then
+             echo "        Banned IPs across nftables: $fail2ban_ips"
+        fi
+    fi
+}
+
+check_fail2ban() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    if ! command -v fail2ban-client >/dev/null; then
+        print_warn "Fail2ban" "Not installed." "Install fail2ban."
+        return
+    fi
+    
+    if [ "$EUID" -ne 0 ]; then
+        print_warn "Fail2ban" "Requires sudo." "Run with sudo to check fail2ban."
+        return
+    fi
+    
+    if ! systemctl is-active --quiet fail2ban; then
+        print_warn "Fail2ban" "Service not active." "Start fail2ban service."
+        return
+    fi
+    
+    local sshd_status
+    sshd_status=$(fail2ban-client status sshd 2>/dev/null)
+    
+    if [[ -z "$sshd_status" ]]; then
+        print_warn "Fail2ban" "sshd jail not enabled." "Enable sshd jail in fail2ban."
+        return
+    fi
+    
+    local currently_banned
+    currently_banned=$(echo "$sshd_status" | grep "Currently banned:" | awk '{print $4}')
+    local total_banned
+    total_banned=$(echo "$sshd_status" | grep "Total banned:" | awk '{print $4}')
+    
+    print_ok "Fail2ban" "Active. sshd jail enabled. Currently banned: ${currently_banned:-0}."
+    
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        echo -e "      ${COLOR_BOLD}sshd jail status:${COLOR_RESET}"
+        echo "        Currently banned: ${currently_banned:-0}"
+        echo "        Total banned: ${total_banned:-0}"
+    fi
+}
+
+check_updates() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q "ok installed"; then
+        status="WARN"
+        summary="unattended-upgrades not installed. "
+        act+="Install unattended-upgrades. "
+    fi
+    
+    if ! systemctl is-active --quiet apt-daily-upgrade.timer; then
+        status="WARN"
+        summary+="apt-daily-upgrade.timer not active. "
+        act+="Enable apt-daily-upgrade.timer. "
+    fi
+    
+    local last_run="Unknown"
+    if [[ -f /var/log/unattended-upgrades/unattended-upgrades.log ]]; then
+        last_run=$(tail -n 100 /var/log/unattended-upgrades/unattended-upgrades.log | grep "unattended-upgrade " | tail -n 1 | awk '{print $1, $2}')
+    fi
+    
+    local log_errors
+    log_errors=$(journalctl -u unattended-upgrades --since "7 days ago" -q 2>/dev/null | grep -i "error" | wc -l)
+    if [[ "$log_errors" -gt 0 ]]; then
+        status="WARN"
+        summary+="Errors in logs ($log_errors). "
+        act+="Check unattended-upgrades logs. "
+    fi
+    
+    local pending_updates=0
+    if command -v apt-get >/dev/null; then
+        pending_updates=$(apt-get -s upgrade 2>/dev/null | grep "^Inst" | grep -i security | wc -l)
+        if [[ "$pending_updates" -gt 0 ]]; then
+            status="WARN"
+            summary+="Security updates pending ($pending_updates). "
+            act+="Apply pending security updates. "
+        fi
+    fi
+    
+    if [[ "$status" == "WARN" ]]; then
+        print_warn "Updates" "$summary" "$act"
+    else
+        print_ok "Updates" "Active. Last run: ${last_run:-Unknown}. Security pending: $pending_updates."
+    fi
+}
+
+check_resources() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    local load1
+    load1=$(awk '{print $1}' /proc/loadavg)
+    
+    local ram_ava ram_tot swap_used
+    ram_ava=$(free -m | awk '/^Mem:/ {print $7}')
+    ram_tot=$(free -m | awk '/^Mem:/ {print $2}')
+    swap_used=$(free -m | awk '/^Swap:/ {print $3}')
+    
+    if awk -v l="$load1" -v w="$LOAD_WARN" 'BEGIN { if (l > w) exit 0; else exit 1 }'; then
+        status="WARN"
+        summary+="Load high ($load1). "
+        act+="Investigate high load. "
+    fi
+    
+    if [[ -n "$ram_ava" && "$ram_ava" -lt "$RAM_WARN_MB" ]]; then
+        status="WARN"
+        summary+="Available RAM low (${ram_ava}MB). "
+        act+="Free up RAM. "
+    fi
+    
+    if [[ -n "$swap_used" && "$swap_used" -gt "$SWAP_WARN_MB" ]]; then
+        status="WARN"
+        summary+="Swap usage high (${swap_used}MB). "
+        act+="Check memory-hungry processes. "
+    fi
+    
+    if [[ "$status" == "WARN" ]]; then
+        print_warn "Resources" "Load: $load1, RAM Ava: ${ram_ava}MB/${ram_tot}MB, Swap: ${swap_used:-0}MB. $summary" "$act"
+    else
+        print_ok "Resources" "Load: $load1, RAM Ava: ${ram_ava}MB/${ram_tot}MB, Swap: ${swap_used:-0}MB."
+    fi
+    
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        echo -e "      ${COLOR_BOLD}Top 5 processes by RSS (RAM):${COLOR_RESET}"
+        ps -eo pid,user,%mem,rss,comm --sort=-rss | head -n 6 | sed 's/^/        /'
+    fi
+}
+
+check_disk() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    local root_usage boot_usage root_dev boot_dev
+    root_usage=$(df -h / | tail -n 1 | awk '{print $5}' | tr -d '%')
+    root_dev=$(df -P / | tail -n 1 | awk '{print $1}')
+    
+    boot_usage=$(df -h /boot 2>/dev/null | tail -n 1 | awk '{print $5}' | tr -d '%')
+    boot_dev=$(df -P /boot 2>/dev/null | tail -n 1 | awk '{print $1}')
+    
+    if [[ -n "$root_usage" ]]; then
+        if [[ "$root_usage" -gt "$DISK_ROOT_CRIT" ]]; then
+            status="CRIT"
+            summary+="Root usage ${root_usage}%. "
+            act+="Free space on root filesystem. "
+        elif [[ "$root_usage" -gt "$DISK_ROOT_WARN" ]]; then
+            status="WARN"
+            summary+="Root usage ${root_usage}%. "
+            act+="Check root filesystem space. "
+        fi
+    fi
+    
+    if [[ -n "$boot_dev" && "$boot_dev" != "$root_dev" && -n "$boot_usage" ]]; then
+        if [[ "$boot_usage" -gt "$DISK_BOOT_WARN" ]]; then
+            if [[ "$status" != "CRIT" ]]; then status="WARN"; fi
+            summary+="/boot usage ${boot_usage}%. "
+            act+="Clear old kernels from /boot. "
+        fi
+    fi
+    
+    local j_usage
+    if command -v journalctl >/dev/null; then
+        j_usage=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?[KMG]B?' | head -1)
+        if [[ -z "$j_usage" ]]; then
+            j_usage="Unknown"
+        fi
+    else
+        j_usage="Unknown"
+    fi
+    
+    local root_inodes
+    root_inodes=$(df -i / 2>/dev/null | tail -n 1 | awk '{print $5}' | tr -d '%')
+    if [[ -n "$root_inodes" && "$root_inodes" -gt "$DISK_ROOT_WARN" ]]; then
+        if [[ "$status" != "CRIT" ]]; then status="WARN"; fi
+        summary+="/ inodes ${root_inodes}%. "
+        act+="Free inodes on root filesystem. "
+    fi
+    
+    if [[ "$status" == "CRIT" ]]; then
+        print_crit "Disk" "$summary" "$act"
+    elif [[ "$status" == "WARN" ]]; then
+        print_warn "Disk" "$summary" "$act"
+    else
+        print_ok "Disk" "/: ${root_usage}%, /boot: ${boot_usage:-N/A}%, journal: ${j_usage:-N/A}."
+    fi
+}
+
+check_services() {
+    local status="OK"
+    local summary=""
+    local act=""
+    
+    local failed_svcs
+    failed_svcs=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+    local failed_count
+    failed_count=$(echo "$failed_svcs" | grep -v "^$" | wc -l)
+    
+    local err_count
+    err_count=$(journalctl -p err -q --since "24 hours ago" 2>/dev/null | grep -v "^-- No entries --" | wc -l)
+    
+    if [[ "$failed_count" -gt 0 ]]; then
+        status="CRIT"
+        summary+="Failed units: $failed_count. "
+        act+="Check failed systemd units. "
+    fi
+    
+    if [[ "$err_count" -gt 0 ]]; then
+        if [[ "$status" != "CRIT" ]]; then status="WARN"; fi
+        summary+="Error logs (24h): $err_count. "
+        act+="Review journalctl error logs. "
+    fi
+    
+    if [[ "$status" == "CRIT" ]]; then
+        print_crit "Services/Logs" "$summary" "$act"
+    elif [[ "$status" == "WARN" ]]; then
+        print_warn "Services/Logs" "$summary" "$act"
+    else
+        print_ok "Services/Logs" "All services OK. 0 errors in logs (24h)."
+    fi
+    
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        if [[ "$failed_count" -gt 0 ]]; then
+            echo -e "      ${COLOR_BOLD}Failed Units:${COLOR_RESET}"
+            echo "$failed_svcs" | sed 's/^/        /'
+        fi
+        if [[ "$err_count" -gt 0 ]]; then
+            echo -e "      ${COLOR_BOLD}Last 10 Critical/Error log lines:${COLOR_RESET}"
+            journalctl -p err -q --since "24 hours ago" 2>/dev/null | tail -n 10 | sed 's/^/        /'
+        fi
+    fi
+}
+
+check_packages() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        local pkg_list
+        pkg_list=$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | sort)
+        local pkg_count
+        pkg_count=$(echo "$pkg_list" | wc -l)
+        
+        echo -e "\n${COLOR_BOLD}[INFO] Packages${COLOR_RESET} - Total installed: $pkg_count"
+        echo "$pkg_list" | sed 's/^/        /'
+    fi
+}
+
+print_footer() {
+    echo "------------------------------------------------------------"
+    local color=""
+    if [[ "$OVERALL_STATUS" == "OK" ]]; then
+        color="$COLOR_OK"
+    elif [[ "$OVERALL_STATUS" == "WARN" ]]; then
+        color="$COLOR_WARN"
+    elif [[ "$OVERALL_STATUS" == "CRIT" ]]; then
+        color="$COLOR_CRIT"
+    fi
+    
+    echo -e "OVERALL STATUS: ${COLOR_BOLD}${color}${OVERALL_STATUS}${COLOR_RESET}"
+    
+    if [[ ${#NEXT_ACTIONS[@]} -gt 0 ]]; then
+        echo -e "\n${COLOR_BOLD}Next Actions Needed:${COLOR_RESET}"
+        printf "%s\n" "${NEXT_ACTIONS[@]}" | sort -u | while read -r action; do
+            [[ -n "$action" ]] && echo "  - $action"
+        done
+    fi
+    echo ""
+}
+
+# Main Execution
+
+if [[ "$VERBOSE" -eq 1 && ! -t 1 && "$USE_COLOR" -eq 1 ]]; then
+   # Graceful check for non-tty override if enforced somehow else.
+   # Our start logic handled this [ -t 1 ] && [ "$USE_COLOR" -eq 1 ]
+   :
+fi
+
+print_header
+
+check_ssh
+check_firewall
+check_fail2ban
+check_updates
+check_resources
+check_disk
+check_services
+check_packages
+
+print_footer
