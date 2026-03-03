@@ -261,18 +261,20 @@ check_fail2ban() {
         # Check if sshd jail exists
         local all_jails
         all_jails=$(fail2ban-client status 2>/dev/null || true)
-        
+
         if echo "$all_jails" | grep -q "sshd"; then
             jail_sshd="yes"
-            
+
             # Get sshd jail status
             local f2b_status
             f2b_status=$(fail2ban-client status sshd 2>/dev/null || true)
-            
-            currently_banned=$(echo "$f2b_status" | grep "Currently banned" | awk '{print $3}' | tr -d '[:space:]')
+
+            # Parse "Currently banned: 6" format
+            currently_banned=$(echo "$f2b_status" | grep "Currently banned:" | awk -F: '{print $2}' | tr -d '[:space:]')
             currently_banned=${currently_banned:-0}
-            
-            total_banned=$(echo "$f2b_status" | grep "Total banned" | awk '{print $3}' | tr -d '[:space:]')
+
+            # Parse "Total banned: 23" format
+            total_banned=$(echo "$f2b_status" | grep "Total banned:" | awk -F: '{print $2}' | tr -d '[:space:]')
             total_banned=${total_banned:-0}
         else
             # Service active but sshd jail missing
@@ -326,11 +328,17 @@ check_firewall() {
         # Check if ruleset exists and has input hook
         if [[ -n "$nft_rules" ]] && echo "$nft_rules" | grep -q "hook input"; then
             fw_type="nftables"
-            local input_policy
-            input_policy=$(echo "$nft_rules" | grep -oP 'hook input[^;]*policy (drop|accept)' | grep -oP 'policy (drop|accept)' | head -1 | awk '{print $2}')
             
-            # Extract allowed tcp/udp dports
-            allowed_ports=$(echo "$nft_rules" | grep -oP 'tcp dport \K\d+|udp dport \K\d+' | sort -u | tr '\n' ',' | sed 's/,$//')
+            # Parse input policy - look for "policy drop" or "policy accept" in input chain
+            local input_policy="unknown"
+            if echo "$nft_rules" | grep -A2 "hook input" | grep -q "policy drop"; then
+                input_policy="drop"
+            elif echo "$nft_rules" | grep -A2 "hook input" | grep -q "policy accept"; then
+                input_policy="accept"
+            fi
+
+            # Extract allowed tcp/udp dports (simple pattern)
+            allowed_ports=$(echo "$nft_rules" | grep -E "tcp dport|udp dport" | grep -oE "[0-9]+" | sort -nu | tr '\n' ',' | sed 's/,$//')
 
             if [[ "$input_policy" == "drop" ]]; then
                 fw_details="input=drop"
