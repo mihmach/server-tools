@@ -1,0 +1,788 @@
+#!/bin/bash
+#
+# scheck — Debian VPS Security & Health Check
+# Spec Version: 2.0
+# Target OS: Debian GNU/Linux (stable, tested on Debian 13)
+#
+
+set -euo pipefail
+
+# Add sbin to PATH for system commands
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+
+# =============================================================================
+# CONFIGURABLE THRESHOLDS
+# =============================================================================
+RAM_WARN_MIB=150
+SWAP_WARN_MIB=50
+LOAD_WARN=2.0
+DISK_WARN=80
+DISK_CRIT=90
+BOOT_WARN=70
+JOURNAL_WARN_PERCENT=80
+SSH_FAILED_PUBKEY_WARN=10
+SSH_FAILED_PASS_WARN=1
+
+# =============================================================================
+# COLOR POLICY
+# =============================================================================
+if [[ -t 1 ]]; then
+    COLORS_ENABLED=true
+    COLOR_OK='\033[0;32m'
+    COLOR_WARN='\033[0;33m'
+    COLOR_CRIT='\033[0;31m'
+    COLOR_RESET='\033[0m'
+else
+    COLORS_ENABLED=false
+    COLOR_OK=''
+    COLOR_WARN=''
+    COLOR_CRIT=''
+    COLOR_RESET=''
+fi
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+color_status() {
+    local status="$1"
+    case "$status" in
+        OK) echo -e "${COLOR_OK}OK${COLOR_RESET}" ;;
+        WARN) echo -e "${COLOR_WARN}WARN${COLOR_RESET}" ;;
+        CRIT) echo -e "${COLOR_CRIT}CRIT${COLOR_RESET}" ;;
+        *) echo "$status" ;;
+    esac
+}
+
+color_value() {
+    local value="$1"
+    local warn="$2"
+    local crit="${3:-}"
+
+    local num_value
+    num_value=$(echo "$value" | sed 's/[^0-9.]//g')
+
+    if [[ -z "$num_value" ]]; then
+        echo "$value"
+        return
+    fi
+
+    # Use awk instead of bc for floating point comparison
+    if [[ -n "$crit" ]] && awk "BEGIN {exit !($num_value >= $crit)}"; then
+        echo -e "${COLOR_CRIT}${value}${COLOR_RESET}"
+    elif [[ -n "$warn" ]] && awk "BEGIN {exit !($num_value >= $warn)}"; then
+        echo -e "${COLOR_WARN}${value}${COLOR_RESET}"
+    else
+        echo -e "${COLOR_OK}${value}${COLOR_RESET}"
+    fi
+}
+
+# =============================================================================
+# ROOT CHECK
+# =============================================================================
+if [[ $EUID -ne 0 ]]; then
+    echo "Run with sudo"
+    exit 1
+fi
+
+# =============================================================================
+# HEADER
+# =============================================================================
+HOSTNAME=$(hostname)
+TIMESTAMP=$(date -Iseconds)
+UPTIME=$(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | cut -d',' -f1-2)
+OS_INFO=$(cat /etc/os-release | grep "^PRETTY_NAME=" | cut -d'"' -f2)
+KERNEL=$(uname -r)
+
+OVERALL_STATUS="OK"
+
+# =============================================================================
+# 5.1 EXPOSURE
+# =============================================================================
+check_exposure() {
+    local status="OK"
+    local listeners=""
+    local seen_ports=""
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        
+        local addr_port proto process addr port netid
+        # Format: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+        netid=$(echo "$line" | awk '{print $1}')
+        addr_port=$(echo "$line" | awk '{print $5}')
+        process=$(echo "$line" | grep -oP 'users:\("\K[^"]+' || echo "")
+        
+        # Skip non-TCP for external exposure (UDP port 68 is DHCP client)
+        [[ "$netid" != "tcp" ]] && continue
+
+        # Extract address and port
+        if [[ "$addr_port" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+            # IPv6: [::]:22
+            addr="[${BASH_REMATCH[1]}]"
+            port="${BASH_REMATCH[2]}"
+        elif [[ "$addr_port" =~ ^(.+):([0-9]+)$ ]]; then
+            # IPv4: 0.0.0.0:22
+            addr="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+        else
+            continue
+        fi
+
+        # Skip localhost
+        [[ "$addr" == "127.0.0.1" || "$addr" == "::1" || "$addr" == "[::1]" ]] && continue
+
+        # Include only external listeners (0.0.0.0, ::, or public IPs)
+        if [[ "$addr" == "0.0.0.0" || "$addr" == "::" || "$addr" == "[::]" ]]; then
+            # Avoid duplicates for dual-stack (IPv4 + IPv6 same port)
+            if [[ ! "$seen_ports" =~ "$port/tcp" ]]; then
+                listeners+="${port}/tcp (${process}) "
+                seen_ports+="${port}/tcp "
+
+                # Check if not in allowlist (default: 22/tcp)
+                if [[ "${port}/tcp" != "22/tcp" ]]; then
+                    status="WARN"
+                fi
+            fi
+        fi
+    done < <(ss -H -lntup 2>/dev/null || true)
+
+    if [[ -z "$listeners" ]]; then
+        listeners="none"
+    fi
+
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" == "OK" ]] && OVERALL_STATUS="WARN"
+
+    echo "[$(color_status "$status")] Exposure - $listeners"
+}
+
+# =============================================================================
+# 5.2 SSH POSTURE
+# =============================================================================
+check_ssh_posture() {
+    local status="OK"
+    local root_login="unknown"
+    local pass_auth="unknown"
+    local kbd_auth="unknown"
+    local pubkey_auth="unknown"
+    local auth_methods="unknown"
+    
+    if command -v sshd &>/dev/null; then
+        local sshd_config
+        sshd_config=$(sshd -T -C "user=root,host=$(hostname),addr=127.0.0.1" 2>/dev/null || true)
+        
+        root_login=$(echo "$sshd_config" | grep "^permitrootlogin" | awk '{print $2}')
+        pass_auth=$(echo "$sshd_config" | grep "^passwordauthentication" | awk '{print $2}')
+        kbd_auth=$(echo "$sshd_config" | grep "^kbdinteractiveauthentication" | awk '{print $2}')
+        pubkey_auth=$(echo "$sshd_config" | grep "^pubkeyauthentication" | awk '{print $2}')
+        auth_methods=$(echo "$sshd_config" | grep "^authenticationmethods" | awk '{print $2}')
+    fi
+    
+    # Status rules
+    if [[ "$root_login" != "no" ]]; then
+        status="CRIT"
+    elif [[ "$pass_auth" != "no" ]]; then
+        status="CRIT"
+    elif [[ "$auth_methods" != "publickey" && -n "$auth_methods" ]]; then
+        status="WARN"
+    fi
+    
+    [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+    
+    echo "[$(color_status "$status")] SSH posture - root=${root_login}, pass=${pass_auth}, kbd=${kbd_auth}, auth=${auth_methods:-publickey}"
+}
+
+# =============================================================================
+# 5.3 SSH NOISE (24h)
+# =============================================================================
+check_ssh_noise() {
+    local status="OK"
+    local failed_password=0
+    local failed_publickey=0
+    local invalid_user=0
+    local preauth_disconnect=0
+    local accepted_publickey=0
+
+    if command -v journalctl &>/dev/null; then
+        local journal_output
+        journal_output=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null || true)
+
+        failed_password=$(echo "$journal_output" | grep -ci "failed password" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        failed_publickey=$(echo "$journal_output" | grep -ci "failed publickey" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        invalid_user=$(echo "$journal_output" | grep -ci "invalid user" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        preauth_disconnect=$(echo "$journal_output" | grep -ciE "preauth disconnect|disconnected from authenticating user" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        accepted_publickey=$(echo "$journal_output" | grep -ci "accepted publickey" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        
+        # Ensure numeric values
+        failed_password=${failed_password:-0}
+        failed_publickey=${failed_publickey:-0}
+        invalid_user=${invalid_user:-0}
+        preauth_disconnect=${preauth_disconnect:-0}
+    fi
+
+    if [[ "$failed_password" -gt 0 ]]; then
+        status="WARN"
+    elif [[ "$failed_publickey" -gt "$SSH_FAILED_PUBKEY_WARN" ]]; then
+        status="WARN"
+    fi
+
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+
+    echo "[$(color_status "$status")] SSH noise (24h) - invalid_user=${invalid_user}, preauth=${preauth_disconnect}, failed_pubkey=$(color_value $failed_publickey $SSH_FAILED_PUBKEY_WARN), failed_pass=$(color_value $failed_password $SSH_FAILED_PASS_WARN)"
+}
+
+# =============================================================================
+# 5.4 FAIL2BAN
+# =============================================================================
+check_fail2ban() {
+    local status="OK"
+    local f2b_active="no"
+    local jail_sshd="no"
+    local currently_banned=0
+    local total_banned=0
+    
+    if command -v systemctl &>/dev/null && systemctl is-active fail2ban &>/dev/null; then
+        f2b_active="yes"
+        
+        if command -v fail2ban-client &>/dev/null; then
+            local f2b_status
+            f2b_status=$(fail2ban-client status sshd 2>/dev/null || true)
+            
+            if echo "$f2b_status" | grep -q "Jail sshd"; then
+                jail_sshd="yes"
+                currently_banned=$(echo "$f2b_status" | grep "Currently banned" | awk '{print $3}' || echo 0)
+                total_banned=$(echo "$f2b_status" | grep "Total banned" | awk '{print $3}' || echo 0)
+            fi
+        fi
+    else
+        status="WARN"
+    fi
+    
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+    
+    echo "[$(color_status "$status")] Fail2ban - active=${f2b_active}, jail_sshd=${jail_sshd}, banned=${currently_banned}/${total_banned}"
+}
+
+# =============================================================================
+# 5.5 FIREWALL
+# =============================================================================
+check_firewall() {
+    local status="OK"
+    local fw_type="none"
+    local fw_details=""
+    
+    # Check ufw first
+    if command -v ufw &>/dev/null && ufw status &>/dev/null; then
+        local ufw_status
+        ufw_status=$(ufw status verbose 2>/dev/null || true)
+        
+        if echo "$ufw_status" | grep -q "Status: active"; then
+            fw_type="ufw"
+            local default_policy
+            default_policy=$(echo "$ufw_status" | grep "Default:" | grep -oP 'deny \(incoming\)|allow \(incoming\)' || echo "unknown")
+            
+            if [[ "$default_policy" == "deny (incoming)" ]]; then
+                fw_details="default=deny"
+            else
+                status="CRIT"
+                fw_details="default=${default_policy}"
+            fi
+        fi
+    fi
+    
+    # Check nftables if ufw not active
+    if [[ "$fw_type" == "none" ]] && command -v nft &>/dev/null; then
+        local nft_rules
+        nft_rules=$(nft list ruleset 2>/dev/null || true)
+        
+        if [[ -n "$nft_rules" ]]; then
+            fw_type="nftables"
+            local input_policy
+            input_policy=$(echo "$nft_rules" | grep -oP 'policy (drop|accept)' | head -1 | awk '{print $2}' || echo "unknown")
+            
+            if [[ "$input_policy" == "drop" ]]; then
+                fw_details="input=drop"
+            elif [[ "$input_policy" == "accept" ]]; then
+                status="CRIT"
+                fw_details="input=accept"
+            else
+                status="WARN"
+                fw_details="input=unknown"
+            fi
+        fi
+    fi
+    
+    if [[ "$fw_type" == "none" ]]; then
+        status="WARN"
+        fw_details="not configured"
+    fi
+    
+    [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+    
+    echo "[$(color_status "$status")] Firewall - ${fw_type} (${fw_details})"
+}
+
+# =============================================================================
+# 5.6 UPDATES
+# =============================================================================
+check_updates() {
+    local status="OK"
+    local uu_installed="no"
+    local timer_active="no"
+    local errors_7d=0
+    local pending=0
+    
+    if dpkg -l unattended-upgrades &>/dev/null; then
+        uu_installed="yes"
+        
+        if command -v systemctl &>/dev/null && systemctl is-active apt-daily-upgrade.timer &>/dev/null; then
+            timer_active="yes"
+        else
+            status="WARN"
+        fi
+        
+        if command -v journalctl &>/dev/null; then
+            errors_7d=$(journalctl -u unattended-upgrades --since "7 days ago" 2>/dev/null | grep -ciE "error|fail" || true)
+            errors_7d=${errors_7d:-0}
+        fi
+
+        if command -v apt &>/dev/null; then
+            pending=$(apt list --upgradable 2>/dev/null | grep -c "security" || true)
+            pending=${pending:-0}
+        fi
+
+        if [[ "$pending" -gt 0 ]]; then
+            status="WARN"
+        fi
+    else
+        status="WARN"
+    fi
+    
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+    
+    echo "[$(color_status "$status")] Updates - pending=$(color_value $pending 1 5), errors_7d=$(color_value $errors_7d 1 5), timer=${timer_active}, uu=${uu_installed}"
+}
+
+# =============================================================================
+# 5.7 RESOURCES
+# =============================================================================
+check_resources() {
+    local status="OK"
+    local load1 load5 load15
+    local ram_avail ram_total ram_used
+    local swap_used swap_total
+    
+    read load1 load5 load15 _ < /proc/loadavg
+
+    ram_total=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    ram_avail=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+    ram_used=$((ram_total - ram_avail))
+    ram_avail_mib=$((ram_avail / 1024))
+
+    swap_total=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
+    swap_free=$(grep SwapFree /proc/meminfo | awk '{print $2}')
+    swap_used=$((swap_total - swap_free))
+    swap_used_mib=$((swap_used / 1024))
+
+    # Compare load using awk (no bc dependency)
+    if awk "BEGIN {exit !($load1 > $LOAD_WARN)}"; then
+        status="WARN"
+    fi
+
+    if [[ "$ram_avail_mib" -lt "$RAM_WARN_MIB" ]]; then
+        status="WARN"
+    fi
+
+    if [[ "$swap_used_mib" -gt "$SWAP_WARN_MIB" ]]; then
+        status="WARN"
+    fi
+    
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+
+    echo "[$(color_status "$status")] Resources - load=$(color_value "${load1}/${load5}/${load15}" "$LOAD_WARN"), ram_avail=$(color_value "${ram_avail_mib}MiB" "$RAM_WARN_MIB"), swap_used=$(color_value "${swap_used_mib}MiB" "$SWAP_WARN_MIB")"
+}
+
+# =============================================================================
+# 5.8 DISK & JOURNALD
+# =============================================================================
+check_disk_journal() {
+    local status="OK"
+    local root_usage boot_usage journal_usage journal_limit
+    
+    root_usage=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
+    boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%' || echo 0)
+    
+    if command -v journalctl &>/dev/null; then
+        journal_usage=$(journalctl --disk-usage 2>/dev/null | grep -oP '\d+\.?\d*[MG]' | head -1 || echo "0M")
+        journal_limit=$(cat /etc/systemd/journald.conf 2>/dev/null | grep -oP 'SystemMaxUse\s*=\s*\K\d+' || echo "")
+    fi
+    
+    if [[ $root_usage -ge $DISK_CRIT ]]; then
+        status="CRIT"
+    elif [[ $root_usage -ge $DISK_WARN ]]; then
+        status="WARN"
+    fi
+    
+    if [[ $boot_usage -ge $BOOT_WARN && "$boot_usage" != "0" ]]; then
+        status="WARN"
+    fi
+    
+    [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+    
+    echo "[$(color_status "$status")] Disk & journald - root=$(color_value "${root_usage}%" $DISK_WARN $DISK_CRIT true), boot=$(color_value "${boot_usage}%" $BOOT_WARN "" true), journal=${journal_usage}"
+}
+
+# =============================================================================
+# 5.9 SERVICE HEALTH
+# =============================================================================
+check_service_health() {
+    local status="OK"
+    local failed_units=0
+    local failed_unit_names=""
+    local journal_err_24h=0
+    local kernel_err_24h=0
+
+    # Get failed systemd units
+    if command -v systemctl &>/dev/null; then
+        failed_units=$(systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d '[:space:]')
+        failed_units=${failed_units:-0}
+        if [[ "$failed_units" -gt 0 ]]; then
+            failed_unit_names=$(systemctl --failed --no-legend 2>/dev/null | awk '{print $1}' | head -5)
+        fi
+    fi
+
+    # Count errors from last 24h
+    if command -v journalctl &>/dev/null; then
+        journal_err_24h=$(journalctl --since "24 hours ago" -p err --no-pager 2>/dev/null | wc -l | tr -d '[:space:]')
+        journal_err_24h=${journal_err_24h:-0}
+        kernel_err_24h=$(journalctl -k --since "24 hours ago" -p err --no-pager 2>/dev/null | wc -l | tr -d '[:space:]')
+        kernel_err_24h=${kernel_err_24h:-0}
+    fi
+
+    # Determine status
+    if [[ "$failed_units" -gt 0 ]]; then
+        status="CRIT"
+    elif [[ "$journal_err_24h" -gt 0 ]]; then
+        status="WARN"
+    fi
+
+    [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+
+    # Output header line
+    echo "[$(color_status "$status")] Service health - failed=${failed_units}, journal=${journal_err_24h}, kernel=${kernel_err_24h} (24h)"
+
+    # Show failed unit names
+    if [[ -n "$failed_unit_names" ]]; then
+        echo "  Failed units:"
+        echo "$failed_unit_names" | while read -r unit; do
+            [[ -n "$unit" ]] && echo "    • ${unit}"
+        done
+    fi
+
+    # Show last 3 journal errors
+    if [[ "$journal_err_24h" -gt 0 ]]; then
+        echo "  Journal errors (last 3):"
+        journalctl --since "24 hours ago" -p err --no-pager -n 3 2>/dev/null | \
+            while IFS= read -r line; do
+                # Extract timestamp and message
+                local ts msg
+                ts=$(echo "$line" | grep -oP '^\S+ \S+' | head -1 || echo "")
+                msg=$(echo "$line" | sed 's/^[A-Za-z]\{3\} [0-9]\{1,2\} [0-9:]\{8\} [^ ]* //' | cut -c1-70)
+                [[ -n "$msg" ]] && echo "    • ${msg}"
+            done
+    fi
+
+    # Show last 3 kernel errors
+    if [[ "$kernel_err_24h" -gt 0 ]]; then
+        echo "  Kernel errors (last 3):"
+        journalctl -k --since "24 hours ago" -p err --no-pager -n 3 2>/dev/null | \
+            while IFS= read -r line; do
+                local msg
+                msg=$(echo "$line" | sed 's/^[A-Za-z]\{3\} [0-9]\{1,2\} [0-9:]\{8\} [^ ]* kernel: //' | cut -c1-70)
+                [[ -n "$msg" ]] && echo "    • ${msg}"
+            done
+    fi
+}
+
+# =============================================================================
+# 5.10 CRITICAL ERRORS (24h)
+# =============================================================================
+check_critical_errors() {
+    local status="OK"
+    local crit_count=0
+    local crit_errors=""
+
+    # Critical patterns to search for
+    local patterns=(
+        "Out of memory"
+        "oom-killer"
+        "kernel panic"
+        "EXT4-fs error"
+        "XFS: Internal error"
+        "I/O error"
+        "buffer I/O error"
+        "filesystem error"
+        "SMART failure"
+        "reallocated sector"
+        "authentication failure"
+        "Failed password for root"
+        "break-in attempt"
+    )
+
+    if command -v journalctl &>/dev/null; then
+        # Search for critical errors in last 24h
+        local journal_crit
+        journal_crit=$(journalctl --since "24 hours ago" -p crit --no-pager 2>/dev/null | tail -20 || true)
+        
+        # Also search for specific patterns in error level
+        local pattern_matches
+        pattern_matches=$(journalctl --since "24 hours ago" -p err --no-pager 2>/dev/null | \
+            grep -iE "$(IFS='|'; echo "${patterns[*]}")" | tail -20 || true)
+        
+        # Combine and deduplicate
+        crit_errors=$(printf "%s\n%s" "$journal_crit" "$pattern_matches" | grep -v '^$' | sort -u | tail -10)
+        crit_count=$(echo "$crit_errors" | grep -c . 2>/dev/null || echo 0)
+        crit_count=${crit_count:-0}
+    fi
+
+    # Check disk space critical
+    local root_usage
+    root_usage=$(df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%' || echo 0)
+    if [[ "$root_usage" -ge 95 ]]; then
+        crit_errors+=$'\n'"DISK CRITICAL: / at ${root_usage}% capacity"
+        ((crit_count++))
+    elif [[ "$root_usage" -ge 90 ]]; then
+        crit_errors+=$'\n'"DISK WARN: / at ${root_usage}% capacity"
+        ((crit_count++))
+        status="WARN"
+    fi
+
+    # Check RAM critical
+    local ram_avail
+    ram_avail=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)
+    local ram_avail_mib=$((ram_avail / 1024))
+    if [[ "$ram_avail_mib" -lt 50 ]]; then
+        crit_errors+=$'\n'"RAM CRITICAL: Only ${ram_avail_mib}MiB available"
+        ((crit_count++))
+    elif [[ "$ram_avail_mib" -lt "$RAM_WARN_MIB" ]]; then
+        crit_errors+=$'\n'"RAM WARN: ${ram_avail_mib}MiB available"
+        ((crit_count++))
+        [[ "$status" == "OK" ]] && status="WARN"
+    fi
+
+    # Determine status
+    if [[ "$crit_count" -gt 0 ]]; then
+        # Check if any truly critical (not just warnings)
+        if echo "$crit_errors" | grep -qiE "CRITICAL|panic|oom|error"; then
+            status="CRIT"
+        fi
+    fi
+
+    [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
+    [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
+
+    # Output
+    if [[ "$crit_count" -eq 0 ]]; then
+        echo "[$(color_status "OK")] Critical errors (24h) - none"
+    else
+        echo "[$(color_status "$status")] Critical errors (24h) - ${crit_count} issue(s) found"
+        echo "$crit_errors" | head -10 | while IFS= read -r line; do
+            [[ -n "$line" ]] && echo "  • ${line:0:75}"
+        done
+    fi
+}
+
+# =============================================================================
+# 5.11 CAPABILITIES
+# =============================================================================
+check_capabilities() {
+    local sshd_ver fw_tool f2b uu chrony git python3 docker cloud_init
+    local nginx apache mysql postgres redis node npm java curl wget vim rsync
+    local tar gzip bzip2 xz zip unzip make cmake gcc gpp pkgconfig
+    local dnsutils netcat socat tmux screen htop iotop
+    local logrotate cron anacron postfix dovecot
+    local certbot
+    local kubectl terraform ansible
+
+    sshd_ver=$(sshd -V 2>&1 | grep -oP 'OpenSSH_\K[0-9.]+' || echo "unknown")
+
+    if command -v nft &>/dev/null && nft list ruleset &>/dev/null; then
+        fw_tool="nft"
+    elif command -v ufw &>/dev/null && ufw status &>/dev/null; then
+        fw_tool="ufw"
+    else
+        fw_tool="none"
+    fi
+
+    f2b="no"
+    command -v fail2ban-client &>/dev/null && f2b="yes"
+
+    uu="no"
+    dpkg -l unattended-upgrades &>/dev/null && uu="yes"
+
+    chrony="no"
+    command -v chronyc &>/dev/null && chrony="yes"
+
+    git="no"
+    command -v git &>/dev/null && git="yes"
+
+    python3="no"
+    command -v python3 &>/dev/null && python3="yes"
+
+    docker="no"
+    command -v docker &>/dev/null && docker="yes"
+
+    cloud_init="no"
+    command -v cloud-init &>/dev/null && cloud_init="yes"
+
+    # Web servers
+    nginx="no"
+    command -v nginx &>/dev/null && nginx="yes"
+
+    apache="no"
+    command -v apachectl &>/dev/null && apache="yes"
+
+    # Databases
+    mysql="no"
+    command -v mysql &>/dev/null && mysql="yes"
+
+    postgres="no"
+    command -v psql &>/dev/null && postgres="yes"
+
+    redis="no"
+    command -v redis-cli &>/dev/null && redis="yes"
+
+    # Runtimes
+    node="no"
+    command -v node &>/dev/null && node="yes"
+
+    npm="no"
+    command -v npm &>/dev/null && npm="yes"
+
+    java="no"
+    command -v java &>/dev/null && java="yes"
+
+    # Common utilities
+    curl="no"
+    command -v curl &>/dev/null && curl="yes"
+
+    wget="no"
+    command -v wget &>/dev/null && wget="yes"
+
+    vim="no"
+    command -v vim &>/dev/null && vim="yes"
+
+    rsync="no"
+    command -v rsync &>/dev/null && rsync="yes"
+
+    # Build tools
+    make="no"
+    command -v make &>/dev/null && make="yes"
+
+    gcc="no"
+    command -v gcc &>/dev/null && gcc="yes"
+
+    gpp="no"
+    command -v g++ &>/dev/null && gpp="yes"
+
+    pkgconfig="no"
+    command -v pkg-config &>/dev/null && pkgconfig="yes"
+
+    cmake="no"
+    command -v cmake &>/dev/null && cmake="yes"
+
+    # Network tools
+    netcat="no"
+    command -v nc &>/dev/null && netcat="yes"
+
+    dnsutils="no"
+    command -v dig &>/dev/null && dnsutils="yes"
+
+    # Terminal multiplexers
+    tmux="no"
+    command -v tmux &>/dev/null && tmux="yes"
+
+    screen="no"
+    command -v screen &>/dev/null && screen="yes"
+
+    # Monitoring
+    htop="no"
+    command -v htop &>/dev/null && htop="yes"
+
+    iotop="no"
+    command -v iotop &>/dev/null && iotop="yes"
+
+    # SSL/TLS
+    certbot="no"
+    command -v certbot &>/dev/null && certbot="yes"
+
+    # Mail
+    postfix="no"
+    command -v postfix &>/dev/null && postfix="yes"
+
+    # Compression
+    gzip="no"
+    command -v gzip &>/dev/null && gzip="yes"
+
+    bzip2="no"
+    command -v bzip2 &>/dev/null && bzip2="yes"
+
+    xz="no"
+    command -v xz &>/dev/null && xz="yes"
+
+    # Config management / DevOps
+    ansible="no"
+    command -v ansible &>/dev/null && ansible="yes"
+
+    terraform="no"
+    command -v terraform &>/dev/null && terraform="yes"
+
+    kubectl="no"
+    command -v kubectl &>/dev/null && kubectl="yes"
+
+    echo "Caps: sshd=${sshd_ver}, fw=${fw_tool}, f2b=${f2b}, uu=${uu}, chrony=${chrony}"
+    echo "      git=${git}, python3=${python3}, docker=${docker}, cloud-init=${cloud_init}"
+    echo "      nginx=${nginx}, apache=${apache}, mysql=${mysql}, postgres=${postgres}, redis=${redis}"
+    echo "      node=${node}, npm=${npm}, java=${java}"
+    echo "      curl=${curl}, wget=${wget}, vim=${vim}, rsync=${rsync}"
+    echo "      make=${make}, gcc=${gcc}, g++=${gpp}, cmake=${cmake}, pkg-config=${pkgconfig}"
+    echo "      nc=${netcat}, dig=${dnsutils}, tmux=${tmux}, screen=${screen}"
+    echo "      htop=${htop}, iotop=${iotop}, certbot=${certbot}, postfix=${postfix}"
+    echo "      gzip=${gzip}, bzip2=${bzip2}, xz=${xz}"
+    echo "      ansible=${ansible}, terraform=${terraform}, kubectl=${kubectl}"
+}
+
+# =============================================================================
+# MAIN OUTPUT
+# =============================================================================
+echo "========================================"
+echo "scheck — Security & Health Report"
+echo "========================================"
+echo "Host: ${HOSTNAME}"
+echo "Time: ${TIMESTAMP}"
+echo "Uptime: ${UPTIME}"
+echo "OS: ${OS_INFO}"
+echo "Kernel: ${KERNEL}"
+echo "Status: $(color_status "$OVERALL_STATUS")"
+echo "========================================"
+echo ""
+
+check_exposure
+check_ssh_posture
+check_ssh_noise
+check_fail2ban
+check_firewall
+check_updates
+check_resources
+check_disk_journal
+check_service_health
+check_critical_errors
+check_capabilities
+
+echo ""
+echo "========================================"
+echo "Overall: $(color_status "$OVERALL_STATUS")"
+echo "========================================"
