@@ -105,13 +105,15 @@ check_exposure() {
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        
+
         local addr_port proto process addr port netid
         # Format: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
         netid=$(echo "$line" | awk '{print $1}')
         addr_port=$(echo "$line" | awk '{print $5}')
-        process=$(echo "$line" | grep -oP 'users:\("\K[^"]+' || echo "")
-        
+        # Extract process name from users:(("sshd",pid=123))
+        process=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' || echo "unknown")
+        [[ -z "$process" ]] && process="unknown"
+
         # Skip non-TCP for external exposure (UDP port 68 is DHCP client)
         [[ "$netid" != "tcp" ]] && continue
 
@@ -240,27 +242,45 @@ check_fail2ban() {
     local jail_sshd="no"
     local currently_banned=0
     local total_banned=0
-    
-    if command -v systemctl &>/dev/null && systemctl is-active fail2ban &>/dev/null; then
-        f2b_active="yes"
-        
-        if command -v fail2ban-client &>/dev/null; then
-            local f2b_status
-            f2b_status=$(fail2ban-client status sshd 2>/dev/null || true)
-            
-            if echo "$f2b_status" | grep -q "Jail sshd"; then
-                jail_sshd="yes"
-                currently_banned=$(echo "$f2b_status" | grep "Currently banned" | awk '{print $3}' || echo 0)
-                total_banned=$(echo "$f2b_status" | grep "Total banned" | awk '{print $3}' || echo 0)
-            fi
+
+    # Check if fail2ban service is active
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active fail2ban &>/dev/null; then
+            f2b_active="yes"
+        else
+            status="WARN"
         fi
     else
         status="WARN"
     fi
-    
+
+    # Only check jails if service is active
+    if [[ "$f2b_active" == "yes" ]] && command -v fail2ban-client &>/dev/null; then
+        # Check if sshd jail exists
+        local all_jails
+        all_jails=$(fail2ban-client status 2>/dev/null || true)
+        
+        if echo "$all_jails" | grep -q "sshd"; then
+            jail_sshd="yes"
+            
+            # Get sshd jail status
+            local f2b_status
+            f2b_status=$(fail2ban-client status sshd 2>/dev/null || true)
+            
+            currently_banned=$(echo "$f2b_status" | grep "Currently banned" | awk '{print $3}' | tr -d '[:space:]')
+            currently_banned=${currently_banned:-0}
+            
+            total_banned=$(echo "$f2b_status" | grep "Total banned" | awk '{print $3}' | tr -d '[:space:]')
+            total_banned=${total_banned:-0}
+        else
+            # Service active but sshd jail missing
+            status="WARN"
+        fi
+    fi
+
     [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
-    
-    echo "[$(color_status "$status")] Fail2ban - active=${f2b_active}, jail_sshd=${jail_sshd}, banned=${currently_banned}/${total_banned}"
+
+    echo "[$(color_status "$status")] Fail2ban - active=${f2b_active}, jail_sshd=${jail_sshd}, banned_now=${currently_banned}, banned_total=${total_banned}"
 }
 
 # =============================================================================
@@ -270,56 +290,67 @@ check_firewall() {
     local status="OK"
     local fw_type="none"
     local fw_details=""
-    
-    # Check ufw first
-    if command -v ufw &>/dev/null && ufw status &>/dev/null; then
+    local allowed_ports=""
+
+    # Check ufw first - by ruleset, not service state
+    if command -v ufw &>/dev/null; then
         local ufw_status
-        ufw_status=$(ufw status verbose 2>/dev/null || true)
-        
+        ufw_status=$(ufw status 2>/dev/null || true)
+
         if echo "$ufw_status" | grep -q "Status: active"; then
             fw_type="ufw"
+            local ufw_verbose
+            ufw_verbose=$(ufw status verbose 2>/dev/null || true)
             local default_policy
-            default_policy=$(echo "$ufw_status" | grep "Default:" | grep -oP 'deny \(incoming\)|allow \(incoming\)' || echo "unknown")
-            
+            default_policy=$(echo "$ufw_verbose" | grep "Default:" | grep -oP 'deny \(incoming\)|allow \(incoming\)' || echo "unknown")
+
             if [[ "$default_policy" == "deny (incoming)" ]]; then
                 fw_details="default=deny"
+                # Extract allowed ports
+                allowed_ports=$(echo "$ufw_status" | grep "ALLOW" | grep -oP '\d+/[a-z]+' | tr '\n' ',' | sed 's/,$//')
+                [[ -n "$allowed_ports" ]] && fw_details="default=deny, allow: ${allowed_ports}"
             else
                 status="CRIT"
                 fw_details="default=${default_policy}"
             fi
         fi
     fi
-    
-    # Check nftables if ufw not active
+
+    # Check nftables by ruleset existence, not systemd state
     if [[ "$fw_type" == "none" ]] && command -v nft &>/dev/null; then
         local nft_rules
         nft_rules=$(nft list ruleset 2>/dev/null || true)
-        
-        if [[ -n "$nft_rules" ]]; then
+
+        # Check if ruleset exists and has input hook
+        if [[ -n "$nft_rules" ]] && echo "$nft_rules" | grep -q "hook input"; then
             fw_type="nftables"
             local input_policy
-            input_policy=$(echo "$nft_rules" | grep -oP 'policy (drop|accept)' | head -1 | awk '{print $2}' || echo "unknown")
+            input_policy=$(echo "$nft_rules" | grep -oP 'hook input[^;]*policy (drop|accept)' | grep -oP 'policy (drop|accept)' | head -1 | awk '{print $2}')
             
+            # Extract allowed tcp/udp dports
+            allowed_ports=$(echo "$nft_rules" | grep -oP 'tcp dport \K\d+|udp dport \K\d+' | sort -u | tr '\n' ',' | sed 's/,$//')
+
             if [[ "$input_policy" == "drop" ]]; then
                 fw_details="input=drop"
+                [[ -n "$allowed_ports" ]] && fw_details="input=drop, allow: ${allowed_ports}"
             elif [[ "$input_policy" == "accept" ]]; then
                 status="CRIT"
                 fw_details="input=accept"
             else
                 status="WARN"
-                fw_details="input=unknown"
+                fw_details="input policy unknown"
             fi
         fi
     fi
-    
+
     if [[ "$fw_type" == "none" ]]; then
         status="WARN"
         fw_details="not configured"
     fi
-    
+
     [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
     [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
-    
+
     echo "[$(color_status "$status")] Firewall - ${fw_type} (${fw_details})"
 }
 
@@ -372,7 +403,8 @@ check_resources() {
     local load1 load5 load15
     local ram_avail ram_total ram_used
     local swap_used swap_total
-    
+    local top_rss=""
+
     read load1 load5 load15 _ < /proc/loadavg
 
     ram_total=$(grep MemTotal /proc/meminfo | awk '{print $2}')
@@ -397,10 +429,24 @@ check_resources() {
     if [[ "$swap_used_mib" -gt "$SWAP_WARN_MIB" ]]; then
         status="WARN"
     fi
-    
+
     [[ "$status" == "WARN" && "$OVERALL_STATUS" != "CRIT" ]] && OVERALL_STATUS="WARN"
 
-    echo "[$(color_status "$status")] Resources - load=$(color_value "${load1}/${load5}/${load15}" "$LOAD_WARN"), ram_avail=$(color_value "${ram_avail_mib}MiB" "$RAM_WARN_MIB"), swap_used=$(color_value "${swap_used_mib}MiB" "$SWAP_WARN_MIB")"
+    # Build base output
+    local base_output
+    base_output="[$(color_status "$status")] Resources - load=$(color_value "${load1}/${load5}/${load15}" "$LOAD_WARN"), ram_avail=$(color_value "${ram_avail_mib}MiB" "$RAM_WARN_MIB"), swap_used=$(color_value "${swap_used_mib}MiB" "$SWAP_WARN_MIB")"
+
+    # Show top RSS processes only if swap or RAM is in warning state
+    if [[ "$swap_used_mib" -gt "$SWAP_WARN_MIB" || "$ram_avail_mib" -lt "$RAM_WARN_MIB" ]]; then
+        # Get top 3-5 processes by RSS
+        top_rss=$(ps -eo pid,comm,rss --sort=-rss 2>/dev/null | head -6 | tail -5 | \
+            awk '{rss_mb=$3/1024; printf "%s(%dMiB) ", $2, rss_mb}' | sed 's/ $//')
+        if [[ -n "$top_rss" ]]; then
+            base_output+=$'\n'"  top_rss: ${top_rss}"
+        fi
+    fi
+
+    echo "$base_output"
 }
 
 # =============================================================================
@@ -453,11 +499,11 @@ check_service_health() {
         fi
     fi
 
-    # Count errors from last 24h
+    # Count only real errors (err..alert levels, not warnings)
     if command -v journalctl &>/dev/null; then
-        journal_err_24h=$(journalctl --since "24 hours ago" -p err --no-pager 2>/dev/null | wc -l | tr -d '[:space:]')
+        journal_err_24h=$(journalctl --since "24 hours ago" -p err..alert --no-pager 2>/dev/null | wc -l | tr -d '[:space:]')
         journal_err_24h=${journal_err_24h:-0}
-        kernel_err_24h=$(journalctl -k --since "24 hours ago" -p err --no-pager 2>/dev/null | wc -l | tr -d '[:space:]')
+        kernel_err_24h=$(journalctl -k --since "24 hours ago" -p err..alert --no-pager 2>/dev/null | wc -l | tr -d '[:space:]')
         kernel_err_24h=${kernel_err_24h:-0}
     fi
 
@@ -482,14 +528,12 @@ check_service_health() {
         done
     fi
 
-    # Show last 3 journal errors
+    # Show last 3-5 journal errors with top repeating message detection
     if [[ "$journal_err_24h" -gt 0 ]]; then
         echo "  Journal errors (last 3):"
-        journalctl --since "24 hours ago" -p err --no-pager -n 3 2>/dev/null | \
+        journalctl --since "24 hours ago" -p err..alert --no-pager -n 3 2>/dev/null | \
             while IFS= read -r line; do
-                # Extract timestamp and message
-                local ts msg
-                ts=$(echo "$line" | grep -oP '^\S+ \S+' | head -1 || echo "")
+                local msg
                 msg=$(echo "$line" | sed 's/^[A-Za-z]\{3\} [0-9]\{1,2\} [0-9:]\{8\} [^ ]* //' | cut -c1-70)
                 [[ -n "$msg" ]] && echo "    • ${msg}"
             done
@@ -498,7 +542,7 @@ check_service_health() {
     # Show last 3 kernel errors
     if [[ "$kernel_err_24h" -gt 0 ]]; then
         echo "  Kernel errors (last 3):"
-        journalctl -k --since "24 hours ago" -p err --no-pager -n 3 2>/dev/null | \
+        journalctl -k --since "24 hours ago" -p err..alert --no-pager -n 3 2>/dev/null | \
             while IFS= read -r line; do
                 local msg
                 msg=$(echo "$line" | sed 's/^[A-Za-z]\{3\} [0-9]\{1,2\} [0-9:]\{8\} [^ ]* kernel: //' | cut -c1-70)
@@ -515,7 +559,7 @@ check_critical_errors() {
     local crit_count=0
     local crit_errors=""
 
-    # Critical patterns to search for
+    # Critical patterns to search for (excluding sudo auth noise)
     local patterns=(
         "Out of memory"
         "oom-killer"
@@ -527,23 +571,34 @@ check_critical_errors() {
         "filesystem error"
         "SMART failure"
         "reallocated sector"
-        "authentication failure"
-        "Failed password for root"
         "break-in attempt"
+    )
+
+    # Patterns to exclude (sudo noise)
+    local exclude_patterns=(
+        "a password is required"
+        "authentication failure.*sudo"
+        "sudo:.*authentication failure"
     )
 
     if command -v journalctl &>/dev/null; then
         # Search for critical errors in last 24h
         local journal_crit
         journal_crit=$(journalctl --since "24 hours ago" -p crit --no-pager 2>/dev/null | tail -20 || true)
-        
+
         # Also search for specific patterns in error level
         local pattern_matches
-        pattern_matches=$(journalctl --since "24 hours ago" -p err --no-pager 2>/dev/null | \
+        pattern_matches=$(journalctl --since "24 hours ago" -p err..alert --no-pager 2>/dev/null | \
             grep -iE "$(IFS='|'; echo "${patterns[*]}")" | tail -20 || true)
-        
+
         # Combine and deduplicate
         crit_errors=$(printf "%s\n%s" "$journal_crit" "$pattern_matches" | grep -v '^$' | sort -u | tail -10)
+        
+        # Filter out sudo auth noise
+        if [[ -n "$crit_errors" ]]; then
+            crit_errors=$(echo "$crit_errors" | grep -ivE "$(IFS='|'; echo "${exclude_patterns[*]}")" || true)
+        fi
+        
         crit_count=$(echo "$crit_errors" | grep -c . 2>/dev/null || echo 0)
         crit_count=${crit_count:-0}
     fi
@@ -557,7 +612,6 @@ check_critical_errors() {
     elif [[ "$root_usage" -ge 90 ]]; then
         crit_errors+=$'\n'"DISK WARN: / at ${root_usage}% capacity"
         ((crit_count++))
-        status="WARN"
     fi
 
     # Check RAM critical
@@ -570,15 +624,11 @@ check_critical_errors() {
     elif [[ "$ram_avail_mib" -lt "$RAM_WARN_MIB" ]]; then
         crit_errors+=$'\n'"RAM WARN: ${ram_avail_mib}MiB available"
         ((crit_count++))
-        [[ "$status" == "OK" ]] && status="WARN"
     fi
 
-    # Determine status
+    # Determine status: if issues > 0 → WARN, else OK
     if [[ "$crit_count" -gt 0 ]]; then
-        # Check if any truly critical (not just warnings)
-        if echo "$crit_errors" | grep -qiE "CRITICAL|panic|oom|error"; then
-            status="CRIT"
-        fi
+        status="WARN"
     fi
 
     [[ "$status" == "CRIT" ]] && OVERALL_STATUS="CRIT"
