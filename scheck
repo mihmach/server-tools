@@ -111,8 +111,10 @@ check_exposure() {
         netid=$(echo "$line" | awk '{print $1}')
         addr_port=$(echo "$line" | awk '{print $5}')
         # Extract process name from users:(("sshd",pid=123))
-        process=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' || echo "unknown")
-        [[ -z "$process" ]] && process="unknown"
+        process=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null)
+        if [[ -z "$process" ]]; then
+            process="unknown"
+        fi
 
         # Skip non-TCP for external exposure (UDP port 68 is DHCP client)
         [[ "$netid" != "tcp" ]] && continue
