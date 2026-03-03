@@ -211,17 +211,22 @@ check_ssh_noise() {
         local journal_output
         journal_output=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null || true)
 
-        failed_password=$(echo "$journal_output" | grep -ci "failed password" 2>/dev/null | tr -d '[:space:]' || echo 0)
-        failed_publickey=$(echo "$journal_output" | grep -ci "failed publickey" 2>/dev/null | tr -d '[:space:]' || echo 0)
-        invalid_user=$(echo "$journal_output" | grep -ci "invalid user" 2>/dev/null | tr -d '[:space:]' || echo 0)
-        preauth_disconnect=$(echo "$journal_output" | grep -ciE "preauth disconnect|disconnected from authenticating user" 2>/dev/null | tr -d '[:space:]' || echo 0)
-        accepted_publickey=$(echo "$journal_output" | grep -ci "accepted publickey" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        failed_password=$(echo "$journal_output" | grep -ci "failed password" || true)
+        failed_publickey=$(echo "$journal_output" | grep -ci "failed publickey" || true)
+        invalid_user=$(echo "$journal_output" | grep -ci "invalid user" || true)
+        preauth_disconnect=$(echo "$journal_output" | grep -ciE "preauth disconnect|disconnected from authenticating user" || true)
+        accepted_publickey=$(echo "$journal_output" | grep -ci "accepted publickey" || true)
+
+        # Ensure numeric values (remove whitespace, default to 0)
+        failed_password=$(echo "$failed_password" | tr -d '[:space:]')
+        failed_publickey=$(echo "$failed_publickey" | tr -d '[:space:]')
+        invalid_user=$(echo "$invalid_user" | tr -d '[:space:]')
+        preauth_disconnect=$(echo "$preauth_disconnect" | tr -d '[:space:]')
         
-        # Ensure numeric values
-        failed_password=${failed_password:-0}
-        failed_publickey=${failed_publickey:-0}
-        invalid_user=${invalid_user:-0}
-        preauth_disconnect=${preauth_disconnect:-0}
+        : "${failed_password:=0}"
+        : "${failed_publickey:=0}"
+        : "${invalid_user:=0}"
+        : "${preauth_disconnect:=0}"
     fi
 
     if [[ "$failed_password" -gt 0 ]]; then
@@ -538,10 +543,11 @@ check_service_health() {
         done
     fi
 
-    # Show last 3-5 journal errors with top repeating message detection
+    # Show last 3-5 journal errors (excluding sudo auth noise)
     if [[ "$journal_err_24h" -gt 0 ]]; then
         echo "  Journal errors (last 3):"
-        journalctl --since "24 hours ago" -p err..alert --no-pager -n 3 2>/dev/null | \
+        journalctl --since "24 hours ago" -p err..alert --no-pager 2>/dev/null | \
+            grep -ivE "pam_unix.*sudo:auth|auth could not|conversation failed" | tail -3 | \
             while IFS= read -r line; do
                 local msg
                 msg=$(echo "$line" | sed 's/^[A-Za-z]\{3\} [0-9]\{1,2\} [0-9:]\{8\} [^ ]* //' | cut -c1-70)
@@ -569,7 +575,7 @@ check_critical_errors() {
     local crit_count=0
     local crit_errors=""
 
-    # Critical patterns to search for (excluding sudo auth noise)
+    # Critical patterns to search for
     local patterns=(
         "Out of memory"
         "oom-killer"
@@ -584,10 +590,12 @@ check_critical_errors() {
         "break-in attempt"
     )
 
-    # Patterns to exclude (sudo noise)
+    # Patterns to exclude (sudo/pam auth noise)
     local exclude_patterns=(
+        "pam_unix.*sudo:auth"
+        "auth could not"
+        "conversation failed"
         "a password is required"
-        "authentication failure.*sudo"
         "sudo:.*authentication failure"
     )
 
@@ -603,12 +611,12 @@ check_critical_errors() {
 
         # Combine and deduplicate
         crit_errors=$(printf "%s\n%s" "$journal_crit" "$pattern_matches" | grep -v '^$' | sort -u | tail -10)
-        
+
         # Filter out sudo auth noise
         if [[ -n "$crit_errors" ]]; then
             crit_errors=$(echo "$crit_errors" | grep -ivE "$(IFS='|'; echo "${exclude_patterns[*]}")" || true)
         fi
-        
+
         crit_count=$(echo "$crit_errors" | grep -c . 2>/dev/null || echo 0)
         crit_count=${crit_count:-0}
     fi
