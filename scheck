@@ -110,9 +110,9 @@ check_exposure() {
         # Format: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
         netid=$(echo "$line" | awk '{print $1}')
         addr_port=$(echo "$line" | awk '{print $5}')
-        # Extract process name from users:(("sshd",pid=123))
-        process=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null)
-        if [[ -z "$process" ]]; then
+        # Extract process name from users:(("sshd",pid=123)) using awk
+        process=$(echo "$line" | awk -F'"' '{print $2}')
+        if [[ -z "$process" || "$process" == "(" ]]; then
             process="unknown"
         fi
 
